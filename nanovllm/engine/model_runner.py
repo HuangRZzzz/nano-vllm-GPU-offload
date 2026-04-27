@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.kv_offload import KVOffloadManager
 from nanovllm.engine.weight_offload import WeightOffloadManager
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -22,7 +23,10 @@ class ModelRunner:
         self.cpu_offload_auto = config.cpu_offload_num_layers == "auto"
         self.cpu_offload_requested = self.cpu_offload_auto or config.cpu_offload_num_layers > 0
         self.cpu_offload_enabled = False
-        self.enforce_eager = config.enforce_eager
+        self.kv_offload_enabled = config.enable_kv_offload
+        self.kv_offload_manager = None
+        self.block_manager = None
+        self.enforce_eager = config.enforce_eager or self.kv_offload_enabled
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -30,7 +34,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        
+
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cpu" if self.cpu_offload_requested else "cuda")
         self.model = Qwen3ForCausalLM(hf_config)
@@ -66,6 +70,8 @@ class ModelRunner:
             del self.graphs, self.graph_pool
         if hasattr(self, "kv_cache"):
             del self.kv_cache
+        if hasattr(self, "cpu_kv_cache"):
+            del self.cpu_kv_cache
         if hasattr(self, "kv_cache_reserve"):
             del self.kv_cache_reserve
         if hasattr(self, "sampler"):
@@ -116,7 +122,7 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-    def                                                                                                                                                                                                          init_weight_offload(self):
+    def init_weight_offload(self):
         model = self.model.model
         model.embed_tokens.to("cuda")
         model.norm.to("cuda")
@@ -132,7 +138,7 @@ class ModelRunner:
         if self.cpu_offload_requested:
             self.weight_offload_manager.initialize()
         self.cpu_offload_enabled = self.weight_offload_manager.enabled
-        self.enforce_eager = self.config.enforce_eager or self.cpu_offload_enabled
+        self.enforce_eager = self.config.enforce_eager or self.cpu_offload_enabled or self.kv_offload_enabled
         if self.cpu_offload_enabled:
             model.weight_offload_manager = self.weight_offload_manager
         torch.cuda.empty_cache()
@@ -213,6 +219,20 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         return 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+
+    def resolve_num_cpu_kvcache_blocks(self, block_bytes: int) -> int:
+        if self.config.num_cpu_kvcache_blocks is not None:
+            return self.config.num_cpu_kvcache_blocks
+        if self.config.cpu_kvcache_gb > 0:
+            return int(self.config.cpu_kvcache_gb * 1024**3) // block_bytes
+        return self.config.num_kvcache_blocks
+
+    def bind_block_manager(self, block_manager) -> None:
+        self.block_manager = block_manager
+        if self.kv_offload_manager is None:
+            return
+        self.kv_offload_manager.bind_block_manager(block_manager)
+        block_manager.bind_kv_offload_manager(self.kv_offload_manager)
 
     @staticmethod
     def module_parameter_bytes(module) -> int:
@@ -308,6 +328,28 @@ class ModelRunner:
             head_dim,
             device="cuda",
         )
+        if self.kv_offload_enabled:
+            num_cpu_blocks = self.resolve_num_cpu_kvcache_blocks(block_bytes)
+            if num_cpu_blocks <= 0:
+                raise RuntimeError("KV offload is enabled but CPU KV cache has zero blocks")
+            config.num_cpu_kvcache_blocks = num_cpu_blocks
+            self.cpu_kv_cache = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                num_cpu_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.kv_offload_manager = KVOffloadManager(self.kv_cache, self.cpu_kv_cache)
+            if self.rank == 0:
+                cpu_bytes = num_cpu_blocks * block_bytes
+                print(
+                    "[nano-vllm] CPU KV cache allocation:\n"
+                    f"  blocks={num_cpu_blocks} ({self.format_bytes(cpu_bytes)})"
+                )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -315,9 +357,16 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+    def get_gpu_block_table(self, seq: Sequence, protected_logical_block_ids=None) -> list[int]:
+        if self.block_manager is not None:
+            return self.block_manager.build_gpu_block_table(seq, protected_logical_block_ids)
+        if self.kv_offload_manager is None:
+            return list(seq.block_table)
+        return self.kv_offload_manager.build_gpu_block_table(seq)
+
+    def prepare_block_tables(self, block_tables: list[list[int]]):
+        max_len = max(len(block_table) for block_table in block_tables)
+        block_tables = [block_table + [-1] * (max_len - len(block_table)) for block_table in block_tables]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -330,8 +379,12 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        gpu_block_tables = []
         use_block_tables = False
+        protected = self.block_manager.logical_ids_from_seqs(seqs) if self.block_manager is not None else []
         for seq in seqs:
+            gpu_block_table = self.get_gpu_block_table(seq, protected) if seq.block_table else []
+            gpu_block_tables.append(gpu_block_table)
             prefill_end = seq.scheduled_prefill_end or len(seq)
             input_ids.extend(seq[seq.num_computed_tokens:prefill_end])
             positions.extend(list(range(seq.num_computed_tokens, prefill_end)))
@@ -345,10 +398,10 @@ class ModelRunner:
                 continue
             use_block_tables = True
             for pos in range(seq.num_computed_tokens, prefill_end):
-                block_id = seq.block_table[pos // self.block_size]
+                block_id = gpu_block_table[pos // self.block_size]
                 slot_mapping.append(block_id * self.block_size + pos % self.block_size)
         if use_block_tables:
-            block_tables = self.prepare_block_tables(seqs)
+            block_tables = self.prepare_block_tables(gpu_block_tables)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -362,16 +415,20 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        gpu_block_tables = []
+        protected = self.block_manager.logical_ids_from_seqs(seqs) if self.block_manager is not None else []
         for seq in seqs:
+            gpu_block_table = self.get_gpu_block_table(seq, protected)
+            gpu_block_tables.append(gpu_block_table)
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(gpu_block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables(gpu_block_tables)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -384,17 +441,23 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        gpu_block_tables = []
+        protected = self.block_manager.logical_ids_from_seqs(seqs) if self.block_manager is not None else []
 
         for seq in decode_seqs:
+            gpu_block_table = self.get_gpu_block_table(seq, protected)
+            gpu_block_tables.append(gpu_block_table)
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
             cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
             max_seqlen_q = max(1, max_seqlen_q)
             max_seqlen_k = max(len(seq), max_seqlen_k)
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            slot_mapping.append(gpu_block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
 
         for seq in prefill_seqs:
+            gpu_block_table = self.get_gpu_block_table(seq, protected)
+            gpu_block_tables.append(gpu_block_table)
             prefill_end = seq.scheduled_prefill_end
             input_ids.extend(seq[seq.num_computed_tokens:prefill_end])
             positions.extend(list(range(seq.num_computed_tokens, prefill_end)))
@@ -405,7 +468,7 @@ class ModelRunner:
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             for pos in range(seq.num_computed_tokens, prefill_end):
-                block_id = seq.block_table[pos // self.block_size]
+                block_id = gpu_block_table[pos // self.block_size]
                 slot_mapping.append(block_id * self.block_size + pos % self.block_size)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -413,7 +476,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables(gpu_block_tables)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return seqs, input_ids, positions
 

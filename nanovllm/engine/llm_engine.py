@@ -31,8 +31,10 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.enable_mixed_batch = config.enable_mixed_batch
+        self.enable_kv_offload = config.enable_kv_offload
         self.last_step_was_mixed = False
         self.scheduler = Scheduler(config)
+        self.model_runner.bind_block_manager(self.scheduler.block_manager)
         atexit.register(self.exit)
 
     def exit(self):

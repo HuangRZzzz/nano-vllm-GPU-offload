@@ -11,10 +11,17 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.enable_kv_offload = config.enable_kv_offload
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            config.enable_kv_offload,
+            config.num_cpu_kvcache_blocks or 0,
+        )
         self.waiting: deque[Sequence] = deque()
         self.prefilling: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.last_decode_batch: list[Sequence] = []
 
     def is_finished(self):
         return not self.waiting and not self.prefilling and not self.running
@@ -37,17 +44,23 @@ class Scheduler:
     def schedule_prefill(self, reserved_tokens: int = 0) -> list[Sequence]:
         scheduled_seqs = []
         num_batched_tokens = reserved_tokens
+        protected = set(self.block_manager.logical_ids_from_seqs(self.last_decode_batch))
         while self.prefilling and num_batched_tokens < self.max_num_batched_tokens:
             seq = self.prefilling.popleft()
+            if not self.block_manager.can_allocate(seq, protected):
+                self.prefilling.appendleft(seq)
+                break
+            self.block_manager.allocate(seq, protected)
             num_batched_tokens += self._schedule_prefill_chunk(seq, num_batched_tokens)
             scheduled_seqs.append(seq)
+            protected.update(seq.block_table)
         num_seqs = len(self.running) + len(self.prefilling) + len(scheduled_seqs)
         while self.waiting and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
             seq = self.waiting[0]
-            if not self.block_manager.can_allocate(seq):
+            if not self.block_manager.can_allocate(seq, protected):
                 break
             num_seqs += 1
-            self.block_manager.allocate(seq)
+            self.block_manager.allocate(seq, protected)
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             if seq.num_prefill_tokens == seq.num_computed_tokens:
@@ -55,38 +68,38 @@ class Scheduler:
                     seq.num_computed_tokens -= 1
                 else:
                     self.running.append(seq)
+                    protected.update(seq.block_table)
                     continue
             num_batched_tokens += self._schedule_prefill_chunk(seq, num_batched_tokens)
             scheduled_seqs.append(seq)
+            protected.update(seq.block_table)
         return scheduled_seqs
 
     def schedule_decode(self, token_budget: int | None = None) -> list[Sequence]:
         scheduled_seqs = []
+        skipped_seqs = []
+        protected = set()
         num_seqs = 0
         num_tokens = 0
         token_budget = self.max_num_batched_tokens if token_budget is None else token_budget
         while self.running and num_seqs < self.max_num_seqs and num_tokens < token_budget:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.prefilling:
-                    self.preempt(self.prefilling.pop())
-                elif self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                num_tokens += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
+            candidate_protected = protected | set(seq.block_table)
+            if not self.block_manager.can_ensure_blocks_on_gpu(seq.block_table, candidate_protected):
+                skipped_seqs.append(seq)
+                continue
+            if not self.block_manager.can_append(seq, candidate_protected):
+                skipped_seqs.append(seq)
+                continue
+            num_seqs += 1
+            num_tokens += 1
+            self.block_manager.may_append(seq, candidate_protected)
+            protected.update(seq.block_table)
+            scheduled_seqs.append(seq)
+        self.last_decode_batch = scheduled_seqs
+        self.running.extendleft(reversed(skipped_seqs))
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs
-
-    def preempt(self, seq: Sequence):
-        seq.status = SequenceStatus.WAITING
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
 
     def postprocess_prefill(self, seqs: list[Sequence], token_ids: list[int]) -> None:
         for seq, token_id in zip(seqs, token_ids):
