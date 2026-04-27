@@ -300,6 +300,17 @@ class BlockManager:
             return len(self.free_gpu_block_ids) >= 1
         return len(protected) + 1 <= self.num_gpu_blocks
 
+    def append_requires_more_gpu_blocks_than_available(self, seq: Sequence) -> bool:
+        return (
+            self.enable_kv_offload
+            and len(seq) % self.block_size == 1
+            and len(set(seq.block_table)) + 1 > self.num_gpu_blocks
+        )
+
+    def allocation_requires_more_gpu_blocks_than_available(self, seq: Sequence) -> bool:
+        required_blocks = len(set(seq.block_table[:seq.num_prefill_blocks])) if seq.block_table else seq.num_prefill_blocks
+        return self.enable_kv_offload and required_blocks > self.num_gpu_blocks
+
     def may_append(self, seq: Sequence, protected_logical_block_ids=None):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]

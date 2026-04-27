@@ -47,6 +47,13 @@ class Scheduler:
         protected = set(self.block_manager.logical_ids_from_seqs(self.last_decode_batch))
         while self.prefilling and num_batched_tokens < self.max_num_batched_tokens:
             seq = self.prefilling.popleft()
+            if self.block_manager.allocation_requires_more_gpu_blocks_than_available(seq):
+                raise RuntimeError(
+                    "A single prefill sequence needs more GPU KV blocks than configured: "
+                    f"required_blocks={seq.num_prefill_blocks}, "
+                    f"num_gpu_blocks={self.block_manager.num_gpu_blocks}. "
+                    "KV offload cannot evict blocks that the current sequence itself needs for attention."
+                )
             if not self.block_manager.can_allocate(seq, protected):
                 self.prefilling.appendleft(seq)
                 break
@@ -57,6 +64,13 @@ class Scheduler:
         num_seqs = len(self.running) + len(self.prefilling) + len(scheduled_seqs)
         while self.waiting and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
             seq = self.waiting[0]
+            if self.block_manager.allocation_requires_more_gpu_blocks_than_available(seq):
+                raise RuntimeError(
+                    "A single prefill sequence needs more GPU KV blocks than configured: "
+                    f"required_blocks={seq.num_prefill_blocks}, "
+                    f"num_gpu_blocks={self.block_manager.num_gpu_blocks}. "
+                    "KV offload cannot evict blocks that the current sequence itself needs for attention."
+                )
             if not self.block_manager.can_allocate(seq, protected):
                 break
             num_seqs += 1
@@ -88,6 +102,14 @@ class Scheduler:
             if not self.block_manager.can_ensure_blocks_on_gpu(seq.block_table, candidate_protected):
                 skipped_seqs.append(seq)
                 continue
+            if self.block_manager.append_requires_more_gpu_blocks_than_available(seq):
+                raise RuntimeError(
+                    "A single decode sequence needs more GPU KV blocks than configured after appending a new block: "
+                    f"required_blocks={len(set(seq.block_table)) + 1}, "
+                    f"num_gpu_blocks={self.block_manager.num_gpu_blocks}. "
+                    "Increase max_num_kvcache_blocks or reduce prompt/output length. "
+                    "KV offload can move inactive blocks to CPU, but the active sequence's full context must fit on GPU."
+                )
             if not self.block_manager.can_append(seq, candidate_protected):
                 skipped_seqs.append(seq)
                 continue
