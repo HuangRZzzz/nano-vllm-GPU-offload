@@ -38,9 +38,9 @@ def parse_args():
             "prefill/decode throughput, TTFT, and request latency."
         )
     )
-    parser.add_argument("--model-path", type=str, default=None)
+    parser.add_argument("--model-path", type=str, default="/home/zl/hrz/temp/nano-vllm/Qwen3-0.6B")
     parser.add_argument("--mode", choices=("burst", "stream"), default="burst")
-    parser.add_argument("--num-seqs", type=int, default=256)
+    parser.add_argument("--num-seqs", type=int, default=32)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seed-step", type=int, default=0)
@@ -64,6 +64,9 @@ def parse_args():
     parser.add_argument("--min-kvcache-memory-bytes", type=int, default=1024**3)
     parser.add_argument("--cpu-offload-num-layers", type=str, default="0")
     parser.add_argument("--cpu-offload-window-size", type=int, default=1)
+    parser.add_argument("--kv-offload", choices=("on", "off"), default="off")
+    parser.add_argument("--num-cpu-kvcache-blocks", type=int, default=None)
+    parser.add_argument("--cpu-kvcache-gb", type=float, default=0.0)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--mixed-batch", choices=("on", "off", "compare"), default="on")
     parser.add_argument("--json-output", type=str, default=None)
@@ -160,6 +163,7 @@ def create_llm(args, model_path: str, enable_mixed_batch: bool) -> LLM:
         model_path,
         enforce_eager=args.enforce_eager,
         enable_mixed_batch=enable_mixed_batch,
+        enable_kv_offload=args.kv_offload == "on",
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -168,6 +172,8 @@ def create_llm(args, model_path: str, enable_mixed_batch: bool) -> LLM:
         min_num_kvcache_blocks=args.min_num_kvcache_blocks,
         max_num_kvcache_blocks=args.max_num_kvcache_blocks,
         min_kvcache_memory_bytes=args.min_kvcache_memory_bytes,
+        num_cpu_kvcache_blocks=args.num_cpu_kvcache_blocks,
+        cpu_kvcache_gb=args.cpu_kvcache_gb,
         cpu_offload_num_layers=args.cpu_offload_num_layers,
         cpu_offload_window_size=args.cpu_offload_window_size,
     )
@@ -187,6 +193,34 @@ def close_llm(llm: LLM):
         pass
 
 
+def collect_kv_offload_stats(llm: LLM):
+    manager = getattr(llm.model_runner, "kv_offload_manager", None)
+    stats = {"d2h": 0, "h2d": 0}
+    if manager is None:
+        return stats, lambda: None
+
+    original_offload = manager.offload_block
+    original_load = manager.load_block_to_gpu
+
+    def offload_block(block):
+        stats["d2h"] += 1
+        return original_offload(block)
+
+    def load_block_to_gpu(block, protected_logical_block_ids=None):
+        if block.gpu_block_id is None:
+            stats["h2d"] += 1
+        return original_load(block, protected_logical_block_ids)
+
+    manager.offload_block = offload_block
+    manager.load_block_to_gpu = load_block_to_gpu
+
+    def restore():
+        manager.offload_block = original_offload
+        manager.load_block_to_gpu = original_load
+
+    return stats, restore
+
+
 def run_once(
     args,
     model_path: str,
@@ -196,6 +230,7 @@ def run_once(
     enable_mixed_batch: bool,
 ):
     llm = create_llm(args, model_path, enable_mixed_batch)
+    kv_offload_stats, restore_kv_offload_stats = collect_kv_offload_stats(llm)
     try:
         specs = build_request_specs(args, prompt_len, output_len, seed)
         states: list[RequestState] = []
@@ -302,6 +337,8 @@ def run_once(
             "total_throughput_tok_s": total_tokens / wall_time if wall_time > 0 else 0.0,
             "prefill_throughput_tok_s": total_prefill_tokens / total_prefill_time if total_prefill_time > 0 else 0.0,
             "decode_throughput_tok_s": total_decode_tokens / total_decode_time if total_decode_time > 0 else 0.0,
+            "kv_d2h": kv_offload_stats["d2h"],
+            "kv_h2d": kv_offload_stats["h2d"],
             "ttft_p50_s": percentile(ttfts, 50),
             "ttft_p95_s": percentile(ttfts, 95),
             "ttft_p99_s": percentile(ttfts, 99),
@@ -312,6 +349,7 @@ def run_once(
             "submit_delay_p95_s": percentile(submit_delays, 95),
         }
     finally:
+        restore_kv_offload_stats()
         close_llm(llm)
 
 
@@ -325,6 +363,8 @@ def summarize_runs(runs: list[dict]) -> dict:
         "total_throughput_tok_s",
         "prefill_throughput_tok_s",
         "decode_throughput_tok_s",
+        "kv_d2h",
+        "kv_h2d",
         "ttft_p50_s",
         "ttft_p95_s",
         "latency_p50_s",
@@ -361,6 +401,7 @@ def case_label(args, prompt_len: int | None, output_len: int | None, enable_mixe
     label = (
         f"mode={args.mode} num_seqs={args.num_seqs} "
         f"prompt={prompt_desc} output={output_desc} "
+        f"kv_offload={args.kv_offload} "
         f"mixed_batch={'on' if enable_mixed_batch else 'off'}"
     )
     if args.mode == "stream":
@@ -374,6 +415,8 @@ def print_run_summary(run_idx: int, run: dict):
         f"busy={run['engine_busy_time_s']:.2f}s "
         f"busy_pct={run['gpu_busy_pct']:.1f}% "
         f"mixed={run['mixed_time_s']:.2f}s/{run['mixed_steps']}steps "
+        f"kv_d2h={run['kv_d2h']} "
+        f"kv_h2d={run['kv_h2d']} "
         f"total={run['total_throughput_tok_s']:.2f}tok/s "
         f"out={run['output_throughput_tok_s']:.2f}tok/s "
         f"prefill={run['prefill_throughput_tok_s']:.2f}tok/s "
@@ -389,6 +432,8 @@ def print_case_summary(summary: dict):
     print(
         "  summary: "
         f"mixed={summary['mixed_time_s_mean']:.2f}s/{summary['mixed_steps_mean']:.1f}steps "
+        f"kv_d2h={summary['kv_d2h_mean']:.1f} "
+        f"kv_h2d={summary['kv_h2d_mean']:.1f} "
         f"total={summary['total_throughput_tok_s_mean']:.2f}±{summary['total_throughput_tok_s_std']:.2f}tok/s "
         f"out={summary['output_throughput_tok_s_mean']:.2f}±{summary['output_throughput_tok_s_std']:.2f}tok/s "
         f"prefill={summary['prefill_throughput_tok_s_mean']:.2f}±{summary['prefill_throughput_tok_s_std']:.2f}tok/s "
@@ -464,6 +509,9 @@ def main():
                             "output_len": output_len,
                             "qps": args.qps if args.mode == "stream" else None,
                             "repeats": args.repeats,
+                            "kv_offload": args.kv_offload == "on",
+                            "num_cpu_kvcache_blocks": args.num_cpu_kvcache_blocks,
+                            "cpu_kvcache_gb": args.cpu_kvcache_gb,
                             "mixed_batch": enable_mixed_batch,
                         },
                         "runs": runs,
